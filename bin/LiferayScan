@@ -6,6 +6,9 @@ require 'LiferayScan'
 require 'optparse'
 require 'terminal-table'
 require 'resolv'
+require 'json'
+require 'fileutils'
+
 
 def banner
   puts "
@@ -46,6 +49,14 @@ opts = OptionParser.new do |opts|
     puts opts
     exit
   end
+
+  opts.on('-i INPUT FILE', '--input INPUT FILE', 'File with URLs') do |i|
+      options[:in] = i
+  end
+
+  opts.on('-o OUTPUT FILE', '--output OUTPUT FILE', 'Output file') do |o|
+      options[:out] = o
+  end
 end
 
 opts.parse!
@@ -53,14 +64,12 @@ opts.parse!
 $VERBOSE = true unless options[:verbose].nil?
 @check = true unless options[:skip]
 
-if options[:url].nil?
- puts opts
- exit
-end
-
 def scan(url)
   puts "Scan started at #{Time.now.getutc}"
   puts "URL: #{url}"
+
+  # Hash output
+  out = { "vulns" => {}, "details" => {url => {} } }
 
   # parse URL
   target = nil
@@ -68,8 +77,10 @@ def scan(url)
     target = URI::parse(url.split('?').first)
   rescue
     puts "- Could not parse target URL: #{url}"
+    puts "Scan finished at #{Time.now.getutc}"
+    puts 
+    return {"error" => url}
   end
-  exit(1) if target.nil?
 
   # resolve IP address
   begin
@@ -80,7 +91,7 @@ def scan(url)
   end
 
   puts "Port: #{target.port}"
-  puts '-'*60
+  puts 
 
   # check if Liferay
   if @check
@@ -88,38 +99,47 @@ def scan(url)
       puts "+ Found Liferay Portal"
     else
       puts "- Liferay Portal not found"
-      exit(1)
+      puts "Scan finished at #{Time.now.getutc}"
+      puts
+      return { "not_found" => url }
     end
   end
 
   # version
   version = LiferayScan::getVersion(url)
   puts "+ Version: #{version}" if version
+  check(version, out, url, "version")
 
   # language
   language = LiferayScan::getLanguage(url)
   puts "+ Language: #{language}" if language
+  check(language, out, url, "lang")
 
   # organisation email address domain
   domain = LiferayScan::getOrganisationEmail(url)
   puts "+ Organisation Email: #{domain}" if domain
+  check(domain, out, url, "domain")
 
   # user registration enabled
   register = LiferayScan::userRegistration(url)
   puts "+ User registration is enabled" if register
+  check(register, out, url, "registration")
 
   # SOAP API accessible
   soap_api = LiferayScan::remoteSoapApi(url)
   puts "+ Remote SOAP API is available" if soap_api
+  check(soap_api, out, url, "soap_api")
 
   # JSON API accessible
   json_api = LiferayScan::remoteJsonApi(url)
   puts "+ Remote JSON API is available" if json_api
+  check(json_api, out, url, "json_api")
 
   # check if Forgot Password uses CAPTCHA
   captcha = LiferayScan::usesCaptcha(url)
   puts "+ Password reset does not use CAPTCHA" unless captcha
-
+  check(!captcha, out, url, "captcha")
+  
   # users
   users = LiferayScan::enumerateUsers(url)
   unless users.empty?
@@ -127,13 +147,79 @@ def scan(url)
     table = Terminal::Table.new :headings => ['Screen Name', 'Full Name'], :rows => users
     puts table
   end
+  check(users.any?, out, url, "users", users)
 
   # installed portlets
   portlets = LiferayScan::enumeratePortlets(url)
   puts "+ Found portlets (#{portlets.length}): #{portlets.join(', ')}" unless portlets.empty?
+  check(portlets.any?, out, url, "portlets", portlets)
 
   puts "Scan finished at #{Time.now.getutc}"
   puts '-'*60
+
+  return out
 end
 
-scan(options[:url])
+def check(result, out, url, name, data=true)
+  if result 
+    out['vulns'].store(name, true)
+    out['details'][url].store(name, data)
+  else
+    out['details'][url].store(name, false)
+  end
+end
+
+def mergeResults(init_hash, new_hash, data)
+    if new_hash.has_key? 'error'
+        init_hash['errors'].push(new_hash['error']) unless init_hash['errors'].include? new_hash['error']
+    elsif new_hash.has_key? 'not_found'
+        init_hash['not_found'].push(new_hash['not_found']) unless init_hash.include? new_hash['not_found']
+    else
+        new_hash['vulns'].each do |name_vuln, found|
+            if found
+                if init_hash['vulns'].has_key? name_vuln
+                    init_hash['vulns'][name_vuln].push(data) unless init_hash['vulns'][name_vuln].include? data
+                else
+                    init_hash['vulns'].store(name_vuln, [data])
+                end
+            end
+        end
+
+        new_hash['details'].each do |url, vulns|
+            init_hash['details'].store(url, vulns) unless init_hash['details'].has_key? url
+        end
+    end
+end
+
+
+
+def main(opt)
+  output = { "vulns" => {}, "not_found" => [], "errors" => [], "details" => {}}
+  if opt[:in].nil?
+    if opt[:url].nil?
+      puts opts
+      exit
+    else
+      url = opt[:url]
+      results = scan(url)
+      mergeResults(output, results, url)
+    end
+  else
+    File.open(opt[:in]) do |in_file| 
+      in_file.each_line do |url|
+        url = url.gsub("\n", "")
+        url = url.gsub(" ", "")
+        results = scan(url)
+        mergeResults(output, results, url)
+      end
+    end
+  end
+
+  if opt[:out]
+    File.open(opt[:out], "w") do |f|
+      f << output.to_json
+    end
+  end
+end
+
+main(options)
